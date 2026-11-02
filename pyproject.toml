@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "saffron"
+dynamic = ["version"]
+description = "A small native SPICE viewer (a remote-viewer stand-in), built on IT Toolbox's SPICE client."
+requires-python = ">=3.11"
+license = "Apache-2.0"
+# PyGObject + spice-glib come from the OS package manager (apt/dnf/Homebrew):
+# PyGObject needs the system's GObject-Introspection libraries, and
+# spice-glib is a native library pip can't provide.
+dependencies = ["PySide6"]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-qt"]
+
+[project.gui-scripts]
+saffron = "saffron.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "saffron.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"saffron" = ["resources/*.svg"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

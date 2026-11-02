@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2a2320"/>
+      <stop offset="1" stop-color="#161210"/>
+    </linearGradient>
+    <linearGradient id="thread" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffb43a"/>
+      <stop offset="1" stop-color="#d9481c"/>
+    </linearGradient>
+  </defs>
+  <rect x="64" y="64" width="896" height="896" rx="200" fill="url(#bg)"/>
+  <!-- monitor -->
+  <rect x="200" y="230" width="624" height="430" rx="44" fill="none" stroke="#f2a33a" stroke-width="40"/>
+  <path d="M432 660 L408 760 M592 660 L616 760 M360 772 H664" stroke="#f2a33a" stroke-width="40" stroke-linecap="round" fill="none"/>
+  <!-- three saffron threads on the screen -->
+  <path d="M512 600 C 500 500, 470 420, 420 330" stroke="url(#thread)" stroke-width="34" stroke-linecap="round" fill="none"/>
+  <path d="M512 600 C 512 490, 512 400, 512 300" stroke="url(#thread)" stroke-width="34" stroke-linecap="round" fill="none"/>
+  <path d="M512 600 C 524 500, 554 420, 604 330" stroke="url(#thread)" stroke-width="34" stroke-linecap="round" fill="none"/>
+  <circle cx="420" cy="322" r="26" fill="#ffc54d"/>
+  <circle cx="512" cy="292" r="26" fill="#ffc54d"/>
+  <circle cx="604" cy="322" r="26" fill="#ffc54d"/>
+</svg>

@@ -1,0 +1,666 @@
+"""Qt-free SPICE client session, built on SpiceClientGLib (PyGObject).
+
+Carried over from IT Toolbox (ryanvanmass/it-toolbox, core/spice/
+spice_session.py), extended with TLS/CA/proxy support for .vv files.
+References to docs/ below are to IT Toolbox's docs.
+
+Verified against the real SpiceClientGLib GObject-Introspection typelib on
+this machine (`GIRepository`), not just recalled from memory or docs —
+see docs/qemu-spice-status.md for how that verification was done and why
+this shape works for SPICE (no GTK widget needed at all; DisplayChannel's
+raw-pixel signals are a closer match to QImage-painting than FreeRDP's GDI
+hook was).
+
+Milestones 3-4 scope: connect()/disconnect() and single-monitor frame
+capture. Input (InputsChannel.motion/button_press/key_press) lands in a
+later milestone — see docs/qemu-spice-status.md's milestone list.
+
+One binding quirk worth flagging: both `SpiceClientGLib.Session` and
+`SpiceClientGLib.Channel` (and so every Channel subclass — MainChannel,
+DisplayChannel, InputsChannel, ...) have *native* `connect()`/
+`disconnect()` methods (spice_session_connect/_disconnect,
+spice_channel_connect/_disconnect in the C API), which shadow
+GObject.Object's own `.connect()` used for signal hookup. Confirmed
+empirically, not just inferred from the docs — `channel.connect("channel-
+event", cb)` raises `TypeError: takes exactly 1 argument (3 given)`.
+Signals on either kind of object are therefore always wired via
+`GObject.Object.connect(obj, signal, callback)` explicitly, never
+`obj.connect(signal, callback)`.
+
+A second binding quirk, found while building frame capture:
+`DisplayChannel.display_channel_get_primary()` (the "pull" API for the
+current primary surface) comes back with garbage/misaligned fields
+through this binding — confirmed by calling it and getting nonsense
+values (e.g. `stride=-1`, `format` in the trillions) even though the VM
+under test was rendering fine. The `display-primary-create` *signal*'s
+arguments are reliable, though (verified pixel-perfect against `virsh
+screenshot`'s independent capture — see below), so this module caches
+format/width/height/stride/the raw pixel pointer from that signal instead
+of ever calling the pull API.
+
+Pixel format, empirically confirmed rather than assumed: SPICE surface
+format 32 (32 bits/pixel) is byte order B,G,R,X in memory — i.e. the same
+layout as `QImage.Format_RGB32` and FreeRDP's `PIXEL_FORMAT_BGRX32` here.
+Confirmed by capturing a live frame from a real VM via this module and
+comparing it pixel-by-pixel against `virsh screenshot`'s independent
+libvirt-side capture at the same instant: 0 differing pixels across a
+sparse full-frame sample, on a frame with real (non-black) content.
+`imgdata` itself arrives as a plain Python int (a raw pointer address,
+not a buffer/bytes object) — read via `ctypes.string_at`, same as
+FreeRDP's GDI buffer.
+"""
+
+import ctypes
+import os
+import tempfile
+import threading
+from collections.abc import Callable
+
+import gi
+
+gi.require_version("SpiceClientGLib", "2.0")
+from gi.repository import GObject, SpiceClientGLib  # noqa: E402 - gi.require_version must run first
+
+from saffron.spec import ConnectionSpec  # noqa: E402
+
+# This module only drives a single embedded display, matching RdpWidget's
+# one-screen-per-tab shape — a VM with multiple monitors gets additional
+# DisplayChannels with higher channel-ids, which are ignored here.
+PRIMARY_DISPLAY_CHANNEL_ID = 0
+
+# SPICE wire-protocol constants (spice/enums.h's SpiceMouseButton /
+# SpiceMouseButtonMask) — verified against the upstream spice-protocol
+# header (github.com/flexVDI/spice-protocol, a mirror of the canonical
+# freedesktop.org source), not recalled from memory: button identifiers
+# are LEFT=1/MIDDLE=2/RIGHT=3/UP=4(wheel up)/DOWN=5(wheel down); the
+# button_state bitmask uses LEFT=1<<0/MIDDLE=1<<1/RIGHT=1<<2 (no mask
+# bits exist for the wheel "buttons" — they're momentary, not held).
+_MOUSE_BUTTON = {"left": 1, "middle": 2, "right": 3}
+_MOUSE_BUTTON_MASK = {"left": 1 << 0, "middle": 1 << 1, "right": 1 << 2}
+_WHEEL_UP_BUTTON = 4
+_WHEEL_DOWN_BUTTON = 5
+
+# spice-vdagent capability bit for "the guest can be asked to resize its
+# display" -- verified against the real installed spice-protocol package's
+# spice/vd_agent.h on the dev VM (`enum { VD_AGENT_CAP_MOUSE_STATE = 0,
+# VD_AGENT_CAP_MONITORS_CONFIG, ... }`), not recalled from memory alone.
+# Not exposed as a GObject-Introspection enum (it's a plain C #define-style
+# enum spice-glib's typelib doesn't reflect), so this is the raw bit
+# position, passed straight to MainChannel.agent_test_capability().
+_VD_AGENT_CAP_MONITORS_CONFIG = 1
+
+# Host-to-guest clipboard constants, same source and same reason as
+# _VD_AGENT_CAP_MONITORS_CONFIG above (spice/vd_agent.h, not reflected by
+# the typelib): VD_AGENT_CAP_CLIPBOARD_BY_DEMAND is the capability bit for
+# the grab/request/notify flow below, VD_AGENT_CLIPBOARD_UTF8_TEXT the only
+# clipboard type this v1 supports, VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD
+# the regular Ctrl+C/Ctrl+V clipboard (not X11's PRIMARY selection).
+_VD_AGENT_CAP_CLIPBOARD_BY_DEMAND = 5
+_VD_AGENT_CLIPBOARD_UTF8_TEXT = 1
+_VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD = 0
+
+_ERROR_EVENTS = {
+    SpiceClientGLib.ChannelEvent.ERROR_CONNECT,
+    SpiceClientGLib.ChannelEvent.ERROR_TLS,
+    SpiceClientGLib.ChannelEvent.ERROR_LINK,
+    SpiceClientGLib.ChannelEvent.ERROR_AUTH,
+    SpiceClientGLib.ChannelEvent.ERROR_IO,
+}
+
+
+# What each failure usually means in practice, for the error dialog.
+_ERROR_MESSAGES = {
+    SpiceClientGLib.ChannelEvent.ERROR_CONNECT: "Couldn't reach the SPICE server (is the VM running, and the port or proxy reachable?)",
+    SpiceClientGLib.ChannelEvent.ERROR_TLS: "The TLS connection failed: the server's certificate didn't match the expected CA or subject",
+    SpiceClientGLib.ChannelEvent.ERROR_LINK: "The SPICE server rejected the connection",
+    SpiceClientGLib.ChannelEvent.ERROR_AUTH: "Authentication failed: wrong password, or the one-time ticket has expired",
+    SpiceClientGLib.ChannelEvent.ERROR_IO: "The connection to the SPICE server was lost",
+}
+
+
+class SpiceError(Exception):
+    pass
+
+
+class SpiceSession:
+    """One SPICE client session for the lifetime of a single VM connection.
+
+    Signal callbacks from spice-glib fire on whatever thread runs the
+    GLib main loop driving this session — this class itself creates no
+    thread or main loop; that's SpiceSessionWorker's job (mirroring
+    FreeRdpSession/RdpSessionWorker's split), so connect()/disconnect()
+    here assume a GLib.MainLoop is already running elsewhere.
+    """
+
+    def __init__(self) -> None:
+        self._session = SpiceClientGLib.Session()
+        self._ca_file: str | None = None
+        self._main_channel: SpiceClientGLib.MainChannel | None = None
+        self._display_channel: SpiceClientGLib.DisplayChannel | None = None
+        self._inputs_channel: SpiceClientGLib.InputsChannel | None = None
+        self._connected = threading.Event()
+        self._error: SpiceError | None = None
+        # Bitmask of currently-held mouse buttons — SPICE's position()/
+        # motion() calls always carry the full current button state
+        # alongside the coordinates, not just "which button changed".
+        self._button_mask: int = 0
+        # Host-side clipboard text, cached regardless of agent state so it
+        # can be (re-)announced the moment the agent connects -- see
+        # announce_clipboard_text(). `_clipboard_grabbed` tracks whether
+        # this client currently holds a grab on the guest's clipboard, so
+        # the host clipboard going non-text only releases a grab that's
+        # actually ours.
+        self._clipboard_text: str | None = None
+        self._clipboard_grabbed = False
+        # True while cached text is still waiting for an agent that can
+        # take it -- see _on_agent_update. Kept separate from
+        # `_clipboard_grabbed` so a guest-side copy (which also drops our
+        # grab) isn't stomped by re-announcing stale host text.
+        self._clipboard_pending = False
+
+        # Cached from the display-primary-create signal — see module
+        # docstring for why this is read from the signal, not pulled via
+        # display_channel_get_primary().
+        self._format: int | None = None
+        self._width: int = 0
+        self._height: int = 0
+        self._stride: int = 0
+        self._imgdata: int | None = None
+
+        # Union of every display-invalidate row range seen since the last
+        # get_dirty_band() call, as (top, bottom_exclusive) -- e.g. dragging
+        # a window only ever touches a limited vertical band of the full
+        # display, not the whole thing, so tracking rows (not just "some
+        # invalidate happened, somewhere") is what lets a caller copy and
+        # repaint only what actually changed. Row range only, not a full
+        # x/y/width/height rectangle -- the framebuffer is row-major/
+        # stride-contiguous, so clipping columns too would need per-row
+        # slicing for a much smaller extra win than clipping rows already
+        # gives on the common case (something moved/scrolled vertically
+        # within a bounded band).
+        self._dirty_rows: tuple[int, int] | None = None
+
+        # Called (from the GLib main loop thread) whenever a new frame is
+        # available to read via get_frame() — on the initial full-frame
+        # primary-create, and on every subsequent display-invalidate.
+        self.on_frame: Callable[[], None] | None = None
+        # Callback counterparts to connect()'s blocking wait, for a caller
+        # (SpiceSessionWorker) that runs the GLib.MainLoop itself and so
+        # can't block-and-wait on this same thread without deadlocking —
+        # see start_connecting()'s docstring.
+        self.on_connected: Callable[[], None] | None = None
+        self.on_error: Callable[[SpiceError], None] | None = None
+        self.on_disconnected: Callable[[], None] | None = None
+        # Fires once the guest's agent (spice-vdagent or equivalent)
+        # actually finishes connecting -- confirmed live this is a real,
+        # separate, *later* event than the main channel opening (on_connected
+        # above): MainChannel's own "agent-connected" property starts False
+        # and only flips True once the agent handshake completes, which can
+        # take a real, variable amount of time after the SPICE connection
+        # itself is already up (the guest OS has to start the agent service,
+        # which doesn't happen instantly on boot). request_resize()'s own
+        # capability check is only ever accurate *after* this fires -- a
+        # caller that only checks once, right after connecting (e.g. on a
+        # fixed timer), can easily race this and see agent_test_capability()
+        # incorrectly return False for an agent that's actually present and
+        # about to finish connecting, with nothing to ever retry once it
+        # does. See SpiceSessionWorker/SpiceWidget for how this gets used.
+        self.on_agent_connected: Callable[[], None] | None = None
+
+        GObject.Object.connect(self._session, "channel-new", self._on_channel_new)
+        GObject.Object.connect(self._session, "disconnected", self._on_session_disconnected)
+
+    def start_connecting(self, spec: ConnectionSpec) -> None:
+        """Kick off connecting and return immediately — spice_session_connect()
+        itself is non-blocking; it just starts the process, whose outcome
+        arrives later as signals (delivered to on_connected/on_error, and
+        to connect()'s own internal wait). Use this (not connect()) from a
+        thread that itself will drive the GLib main loop, e.g.
+        SpiceSessionRunner — calling the blocking connect() there would
+        deadlock, since the signals it waits on only ever get dispatched
+        while a loop is actually running.
+
+        TLS, CA, certificate-subject and proxy settings map straight onto
+        spice-glib's own SpiceSession properties ("tls-port", "ca-file",
+        "cert-subject", "proxy", "secure-channels"), the same ones
+        remote-viewer sets from a .vv file.
+        """
+        spec.validate()
+        self._session.set_property("host", spec.host)
+        if spec.port is not None:
+            self._session.set_property("port", str(spec.port))
+        if spec.tls_port is not None:
+            self._session.set_property("tls-port", str(spec.tls_port))
+        if spec.password:
+            self._session.set_property("password", spec.password)
+        if spec.ca_pem:
+            self._session.set_property("ca-file", self._write_ca_file(spec.ca_pem))
+        if spec.host_subject:
+            self._session.set_property("cert-subject", spec.host_subject)
+        if spec.proxy:
+            self._session.set_property("proxy", spec.proxy)
+        if spec.secure_channels:
+            self._session.set_property("secure-channels", spec.secure_channels)
+
+        if not self._session.connect():
+            raise SpiceError(f"spice_session_connect failed for {spec.describe()}")
+
+    def _write_ca_file(self, pem: str) -> str:
+        """spice-glib reads the CA from a file each time a TLS channel
+        connects (channels open lazily, after the main one), so the file
+        has to outlive start_connecting(); disconnect() removes it."""
+        fd, path = tempfile.mkstemp(prefix="saffron-ca-", suffix=".pem")
+        with os.fdopen(fd, "w") as f:
+            f.write(pem)
+        self._ca_file = path
+        return path
+
+    def connect(self, spec: ConnectionSpec, timeout: float = 15) -> None:
+        """Start connecting and block until the main channel comes up (or
+        the connection fails, or `timeout` elapses). Requires a
+        GLib.MainLoop already running on a *different* thread (true of
+        every CLI/smoke-test entry point below) — see start_connecting()'s
+        docstring for why this can't be called from the loop's own thread.
+        """
+        self.start_connecting(spec)
+
+        if not self._connected.wait(timeout):
+            raise SpiceError(f"Timed out connecting to {spec.describe()}")
+        if self._error is not None:
+            raise self._error
+
+    def disconnect(self) -> None:
+        self._session.disconnect()
+        if self._ca_file is not None:
+            try:
+                os.unlink(self._ca_file)
+            except OSError:
+                pass
+            self._ca_file = None
+
+    def get_frame(self) -> tuple[bytes, int, int, int]:
+        """The current primary display surface as (pixels, width, height,
+        stride), pixels in BGRX32 byte order (see module docstring).
+        Raises SpiceError if no primary surface has been created yet.
+
+        Always copies the *entire* surface -- fine for a one-shot read
+        (the CLI smoke tests below), but see get_dirty_band() for the
+        streaming case (SpiceSessionWorker), where re-copying the whole
+        thing on every single display-invalidate turned out to be a real,
+        measured cause of choppy playback under a busy guest desktop.
+        """
+        if self._imgdata is None:
+            raise SpiceError("no primary display surface yet")
+        size = self._stride * self._height
+        pixels = ctypes.string_at(self._imgdata, size)
+        return pixels, self._width, self._height, self._stride
+
+    def get_dirty_band(self) -> tuple[bytes, int, int, int, int, int]:
+        """Like get_frame(), but copies only the row range covering every
+        display-invalidate seen since the last call (the full frame, the
+        first time this is called after a new primary surface) --
+        (pixels, band_top, band_height, canvas_width, canvas_height,
+        stride). `pixels` is exactly `stride * band_height` bytes, the
+        rows `[band_top, band_top + band_height)` of the full canvas.
+
+        This is what actually makes a partial update (dragging a window,
+        scrolling a terminal, ...) cheap: `get_frame()` would re-copy and
+        the caller would then have to re-composite the *entire* display
+        for even a one-pixel change; this copies (and lets the caller
+        repaint) only the rows that could plausibly have changed. Raises
+        SpiceError if no primary surface has been created yet.
+        """
+        if self._imgdata is None:
+            raise SpiceError("no primary display surface yet")
+        top, bottom = self._pop_dirty_rows()
+        top = max(0, min(top, self._height))
+        bottom = max(top, min(bottom, self._height))
+        band_height = bottom - top
+        offset = self._imgdata + top * self._stride
+        pixels = ctypes.string_at(offset, self._stride * band_height)
+        return pixels, top, band_height, self._width, self._height, self._stride
+
+    def _pop_dirty_rows(self) -> tuple[int, int]:
+        rows = self._dirty_rows if self._dirty_rows is not None else (0, self._height)
+        self._dirty_rows = None
+        return rows
+
+    # --- input: absolute position + scancode-based keyboard -------------
+    #
+    # Unlike FreeRDP, SPICE's InputsChannel has no separate "unicode text"
+    # fast path — every key goes through key_press/key_release's PC/AT
+    # scancode. A character with no entry in core/rdp/scancodes.SCANCODES
+    # (reused as-is here — same PC/AT Set 1 table, not RDP-specific) has
+    # no way to reach the guest through this channel at all; that's a real
+    # SPICE limitation, not an oversight here.
+
+    def send_mouse_move(self, x: int, y: int) -> None:
+        if self._inputs_channel is None:
+            return
+        self._inputs_channel.position(x, y, PRIMARY_DISPLAY_CHANNEL_ID, self._button_mask)
+
+    def send_mouse_button(self, button: str, down: bool) -> None:
+        if self._inputs_channel is None:
+            return
+        spice_button = _MOUSE_BUTTON.get(button)
+        mask_bit = _MOUSE_BUTTON_MASK.get(button)
+        if spice_button is None or mask_bit is None:
+            return
+        self._button_mask = (self._button_mask | mask_bit) if down else (self._button_mask & ~mask_bit)
+        if down:
+            self._inputs_channel.button_press(spice_button, self._button_mask)
+        else:
+            self._inputs_channel.button_release(spice_button, self._button_mask)
+
+    def send_mouse_wheel(self, steps: int) -> None:
+        """`steps` > 0 scrolls up, < 0 scrolls down — each step is sent as
+        an immediate press+release, matching the wheel's momentary nature
+        (there's no wheel bit in the button_state mask to hold)."""
+        if self._inputs_channel is None or steps == 0:
+            return
+        button = _WHEEL_UP_BUTTON if steps > 0 else _WHEEL_DOWN_BUTTON
+        for _ in range(abs(steps)):
+            self._inputs_channel.button_press(button, self._button_mask)
+            self._inputs_channel.button_release(button, self._button_mask)
+
+    def send_key_scancode(self, code: int, extended: bool, down: bool) -> None:
+        if self._inputs_channel is None:
+            return
+        scancode = (code | 0x100) if extended else code
+        if down:
+            self._inputs_channel.key_press(scancode)
+        else:
+            self._inputs_channel.key_release(scancode)
+
+    def request_resize(self, width: int, height: int) -> None:
+        """Asks the guest's spice-vdagent (if one is present and it
+        advertises monitor-config support) to resize its display to
+        width x height -- the same mechanism a native SPICE client (e.g.
+        virt-viewer) uses to avoid ever needing to scale the picture at
+        all: the guest renders at exactly the requested size instead of
+        the client shrinking/enlarging whatever the guest happens to be
+        using. Silently does nothing if there's no agent yet or it
+        doesn't support this (most guests without spice-vdagent
+        installed) -- the caller keeps working exactly as it does today
+        either way, just still scaling/letterboxing since the guest's
+        own resolution never changes in that case.
+        """
+        if self._main_channel is None:
+            return
+        if not self._main_channel.agent_test_capability(_VD_AGENT_CAP_MONITORS_CONFIG):
+            return
+        self._main_channel.update_display(0, 0, 0, width, height, True)
+        self._main_channel.send_monitor_config()
+
+    def announce_clipboard_text(self, text: str | None) -> None:
+        """Call whenever the host clipboard changes (None/empty = no text
+        on it). Host-to-guest only, mirroring core/rdp/cliprdr.py's
+        ClipboardChannel: this tells the guest's spice-vdagent that the
+        client owns the clipboard and offers UTF-8 text ("grab"); the
+        text itself is only sent once the guest actually pastes and asks
+        for it (_on_clipboard_selection_request). The guest's own
+        clipboard is never read. Caches the text regardless of agent state
+        and only grabs if the agent is connected and supports clipboard --
+        _on_agent_update re-announces it once that happens.
+        Must be called on the GLib main loop thread (see
+        SpiceSessionWorker.send_clipboard_text).
+        """
+        self._clipboard_text = text or None
+        self._clipboard_pending = self._clipboard_text is not None
+        if self._main_channel is None:
+            return
+        if not self._main_channel.agent_test_capability(_VD_AGENT_CAP_CLIPBOARD_BY_DEMAND):
+            return
+        self._clipboard_pending = False
+        if self._clipboard_text is not None:
+            self._main_channel.clipboard_selection_grab(
+                _VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD, [_VD_AGENT_CLIPBOARD_UTF8_TEXT]
+            )
+            self._clipboard_grabbed = True
+        elif self._clipboard_grabbed:
+            # The host clipboard no longer holds text (e.g. an image was
+            # copied) -- drop our grab so the guest doesn't keep pasting
+            # stale text from an earlier copy.
+            self._main_channel.clipboard_selection_release(_VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD)
+            self._clipboard_grabbed = False
+
+    def _on_clipboard_selection_grab(
+        self, channel: SpiceClientGLib.MainChannel, selection: int, types: int, ntypes: int
+    ) -> bool:
+        # The guest copied something itself, taking clipboard ownership
+        # away from this client -- our earlier grab is gone. Returning
+        # False declines to track the guest's clipboard (guest-to-host is
+        # out of scope).
+        if selection == _VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD:
+            self._clipboard_grabbed = False
+        return False
+
+    def _on_clipboard_selection_request(
+        self, channel: SpiceClientGLib.MainChannel, selection: int, clipboard_type: int
+    ) -> bool:
+        # The guest is pasting and wants the data behind our grab.
+        # Returning False tells spice-glib this client can't provide it.
+        if (
+            selection != _VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD
+            or clipboard_type != _VD_AGENT_CLIPBOARD_UTF8_TEXT
+            or self._clipboard_text is None
+        ):
+            return False
+        channel.clipboard_selection_notify(selection, clipboard_type, self._clipboard_text.encode("utf-8"))
+        return True
+
+    def _on_channel_new(
+        self, session: SpiceClientGLib.Session, channel: SpiceClientGLib.Channel
+    ) -> None:
+        if isinstance(channel, SpiceClientGLib.MainChannel):
+            self._main_channel = channel
+            GObject.Object.connect(channel, "channel-event", self._on_main_channel_event)
+            GObject.Object.connect(channel, "notify::agent-connected", self._on_agent_connected_changed)
+            GObject.Object.connect(channel, "main-agent-update", self._on_agent_update)
+            GObject.Object.connect(channel, "main-clipboard-selection-grab", self._on_clipboard_selection_grab)
+            GObject.Object.connect(channel, "main-clipboard-selection-request", self._on_clipboard_selection_request)
+        elif isinstance(channel, SpiceClientGLib.DisplayChannel):
+            if channel.get_property("channel-id") != PRIMARY_DISPLAY_CHANNEL_ID:
+                return
+            self._display_channel = channel
+            GObject.Object.connect(channel, "display-primary-create", self._on_primary_create)
+            GObject.Object.connect(channel, "display-primary-destroy", self._on_primary_destroy)
+            GObject.Object.connect(channel, "display-invalidate", self._on_invalidate)
+            channel.connect()
+        elif isinstance(channel, SpiceClientGLib.InputsChannel):
+            self._inputs_channel = channel
+            channel.connect()
+
+    def _on_main_channel_event(self, channel: SpiceClientGLib.Channel, event: int) -> None:
+        if event == SpiceClientGLib.ChannelEvent.OPENED:
+            self._connected.set()
+            if self.on_connected is not None:
+                self.on_connected()
+        elif event in _ERROR_EVENTS:
+            error = SpiceError(_ERROR_MESSAGES.get(event, f"SPICE main channel error: {event}"))
+            self._error = error
+            self._connected.set()
+            if self.on_error is not None:
+                self.on_error(error)
+
+    def _on_agent_connected_changed(
+        self, channel: SpiceClientGLib.MainChannel, pspec: GObject.ParamSpec
+    ) -> None:
+        # Only the *becomes-connected* transition is interesting here (see
+        # on_agent_connected's docstring) -- ignore it flipping back to
+        # False (e.g. the guest's agent service stopping), since there's
+        # nothing this callback needs to redo for that case.
+        if not channel.get_property("agent-connected"):
+            # A restarted agent starts with no grab from this client;
+            # whatever host text is cached gets re-offered once it's back.
+            self._clipboard_grabbed = False
+            self._clipboard_pending = self._clipboard_text is not None
+            return
+        if self.on_agent_connected is not None:
+            self.on_agent_connected()
+
+    def _on_agent_update(self, channel: SpiceClientGLib.MainChannel) -> None:
+        # agent-connected flips True *before* the agent has announced its
+        # capabilities (confirmed live: agent_test_capability() is still
+        # False for every bit at that point), so re-announcing cached text
+        # from _on_agent_connected_changed silently does nothing.
+        # main-agent-update fires again once the capabilities arrive.
+        if self._clipboard_pending:
+            self.announce_clipboard_text(self._clipboard_text)
+
+    def _on_session_disconnected(self, session: SpiceClientGLib.Session) -> None:
+        self._connected.set()
+        if self.on_disconnected is not None:
+            self.on_disconnected()
+
+    def _on_primary_create(
+        self,
+        channel: SpiceClientGLib.DisplayChannel,
+        fmt: int,
+        width: int,
+        height: int,
+        stride: int,
+        shmid: int,
+        imgdata: int,
+    ) -> None:
+        self._format = fmt
+        self._width = width
+        self._height = height
+        self._stride = stride
+        self._imgdata = imgdata
+        # The whole new surface counts as "dirty" -- there's nothing to
+        # diff against yet, and a resolution change means whatever was in
+        # get_dirty_band()'s bookkeeping before this referred to a canvas
+        # size that no longer exists.
+        self._dirty_rows = (0, height)
+        if self.on_frame is not None:
+            self.on_frame()
+
+    def _on_primary_destroy(self, channel: SpiceClientGLib.DisplayChannel) -> None:
+        # Stop pointing at a buffer the server may free/reuse once the
+        # primary surface goes away (e.g. on a guest resolution change) —
+        # the same stale-pointer hazard class as freerdp_client.py's
+        # disconnect()/DisplayChannel issue.
+        self._imgdata = None
+        self._dirty_rows = None
+
+    def _on_invalidate(
+        self, channel: SpiceClientGLib.DisplayChannel, x: int, y: int, width: int, height: int
+    ) -> None:
+        top, bottom = self._dirty_rows if self._dirty_rows is not None else (y, y + height)
+        self._dirty_rows = (min(top, y), max(bottom, y + height))
+        if self.on_frame is not None:
+            self.on_frame()
+
+
+# -- CLI (smoke-test entry point, no Qt involved) --------------------------
+
+
+def connect_and_disconnect(host: str, port: int, password: str = "") -> None:
+    """Milestone 3 smoke test: connect, confirm the main channel opens,
+    disconnect. Must be run with a GLib.MainLoop pumping on another
+    thread — see _cli_main() below.
+    """
+    session = SpiceSession()
+    session.connect(ConnectionSpec(host=host, port=port, password=password))
+    session.disconnect()
+
+
+def _write_ppm(path: str, pixels: bytes, width: int, height: int, stride: int) -> None:
+    """Writes a raw PPM (P6), converting BGRX to RGB row by row — same
+    convention as freerdp_client._write_ppm (kept as its own small copy
+    here rather than a shared import, matching that module's own
+    self-contained CLI-helper style).
+    """
+    with open(path, "wb") as f:
+        f.write(f"P6\n{width} {height}\n255\n".encode())
+        for y in range(height):
+            row = pixels[y * stride : y * stride + width * 4]
+            rgb = bytearray(width * 3)
+            rgb[0::3] = row[2::4]  # R
+            rgb[1::3] = row[1::4]  # G
+            rgb[2::3] = row[0::4]  # B
+            f.write(rgb)
+
+
+def capture_one_frame(
+    host: str,
+    port: int,
+    password: str,
+    output_path: str,
+    timeout_sec: float = 15.0,
+    settle_sec: float = 2.0,
+) -> None:
+    """Milestone 4 smoke test: connect, wait until the primary display
+    surface has stopped changing for `settle_sec` (mirrors
+    freerdp_client.capture_one_frame's reasoning — confirmed the hard way
+    here too: the very first primary-create can still be a stale/blank
+    surface, e.g. before the guest's display has actually woken up, and
+    capturing on that first signal alone grabbed a black frame while the
+    real screen already had content), save it as a PPM, disconnect.
+    """
+    import time
+
+    session = SpiceSession()
+    last_frame_at = 0.0
+
+    def _on_frame() -> None:
+        nonlocal last_frame_at
+        last_frame_at = time.monotonic()
+
+    session.on_frame = _on_frame
+    session.connect(ConnectionSpec(host=host, port=port, password=password))
+    try:
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            if last_frame_at and time.monotonic() - last_frame_at > settle_sec:
+                break
+            time.sleep(0.1)
+        if not last_frame_at:
+            raise SpiceError(f"no frame painted within {timeout_sec}s")
+        pixels, width, height, stride = session.get_frame()
+        _write_ppm(output_path, pixels, width, height, stride)
+        print(f"Wrote {width}x{height} frame to {output_path}")
+    finally:
+        session.disconnect()
+
+
+def _cli_main() -> None:
+    import argparse
+    import threading as _threading
+
+    from gi.repository import GLib
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Connect to a real SPICE server via SpiceClientGLib. By default "
+            "performs the Milestone-3 connect/disconnect smoke test; with "
+            "--capture-frame, performs the Milestone-4 frame-capture smoke test."
+        )
+    )
+    parser.add_argument("--host", required=True)
+    parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--password", default="")
+    parser.add_argument(
+        "--capture-frame",
+        metavar="PATH",
+        help="Also capture and save the primary display surface as a PPM image to this path.",
+    )
+    args = parser.parse_args()
+
+    loop = GLib.MainLoop()
+    loop_thread = _threading.Thread(target=loop.run, daemon=True)
+    loop_thread.start()
+    try:
+        if args.capture_frame:
+            capture_one_frame(args.host, args.port, args.password, args.capture_frame)
+        else:
+            connect_and_disconnect(args.host, args.port, args.password)
+            print("Connected and disconnected successfully.")
+    finally:
+        loop.quit()
+        loop_thread.join(timeout=5)
+
+
+if __name__ == "__main__":
+    _cli_main()
