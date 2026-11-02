@@ -22,7 +22,9 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          PY="$(brew --prefix python@3.15)/bin/python3.15"
+          # The same Homebrew Python the app's launcher picks.
+          PY="$(SAFFRON_PRINT_PYTHON=1 build/macos/Saffron.app/Contents/MacOS/saffron)"
+          echo "Testing on $PY"
           "$PY" -m venv --system-site-packages .venv
           .venv/bin/pip install pytest pytest-qt
           .venv/bin/python -m pytest -v

@@ -33,6 +33,9 @@ done
 
 for py in "${candidates[@]}"; do
     if [[ -n "$py" && -x "$py" ]] && "$py" -c "$CHECK" 2>/dev/null; then
+        # SAFFRON_PRINT_PYTHON=1: report the interpreter instead of running
+        # (CI runs the test suite on exactly the Python the app would use).
+        if [[ "${SAFFRON_PRINT_PYTHON:-}" == 1 ]]; then echo "$py"; exit 0; fi
         exec "$py" -m saffron "$@"
     fi
 done
